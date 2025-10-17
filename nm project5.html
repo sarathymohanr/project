@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JWT Timer Refresh Demo</title>
+    <style>
+        body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background-color: #f0f2f5; margin: 0; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+        h1 { color: #1e88e5; }
+        .controls button { padding: 10px 15px; margin: 8px 5px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; color: white; transition: background-color 0.3s; }
+        #loginBtn { background-color: #4caf50; }
+        #protectedActionBtn { background-color: #1e88e5; }
+        #logoutBtn { background-color: #f44336; }
+        .controls button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .status-box { margin-top: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; text-align: left; background-color: #e3f2fd; }
+        #statusMessage { font-weight: bold; color: #333; }
+        #timerStatus { font-style: italic; color: #757575; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>JWT Timer Refresh Demo</h1>
+        <p>Uses a **background timer** to proactively refresh the token before expiry.</p>
+        <div class="controls">
+            <button id="loginBtn">1. Login (Get Tokens)</button>
+            <button id="protectedActionBtn" disabled>2. Protected Action</button>
+            <button id="logoutBtn" disabled>3. Logout</button>
+        </div>
+        <div class="status-box">
+            <p><strong>Status:</strong> <span id="statusMessage">Awaiting login...</span></p>
+            <p id="timerStatus">Timer: Not running.</p>
+            <p><strong>Access Token Expiry:</strong> <span id="expiryDisplay">N/A</span></p>
+        </div>
+    </div>
+    <script>
+        // --- Configuration & Constants ---
+        const ACCESS_TOKEN_KEY = 'accessToken';
+        const REFRESH_TOKEN_KEY = 'refreshToken';
+        const API_BASE_URL = 'http://api.mockserver.com';
+        // How long before expiry (in ms) to trigger the refresh attempt.
+        const REFRESH_LEEWAY_MS = 10000; // 10 seconds leeway
+        let refreshTimer = null;
+
+        // --- DOM Elements ---
+        const statusMessage = document.getElementById('statusMessage');
+        const expiryDisplay = document.getElementById('expiryDisplay');
+        const timerStatus = document.getElementById('timerStatus');
+        const loginBtn = document.getElementById('loginBtn');
+        const protectedActionBtn = document.getElementById('protectedActionBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
+
+        // --- Helper Functions ---
+
+        /** Decodes the JWT payload to get the expiry time (exp). */
+        function decodeTokenExpiry(token) {
+            try {
+                const payload = token.split('.')[1];
+                const decoded = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/'))); 
+                return decoded.exp; // Expiration time (in seconds since epoch)
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function setStatus(message, color = 'black') {
+            statusMessage.innerHTML = message;
+            statusMessage.style.color = color;
+        }
+
+        function updateExpiryDisplay(expirySec) {
+            if (!expirySec) {
+                 expiryDisplay.textContent = 'N/A';
+                 return;
+            }
+            const expiryDate = new Date(expirySec * 1000);
+            expiryDisplay.textContent = expiryDate.toLocaleTimeString();
+        }
+
+        function updateUI() {
+            const hasToken = !!localStorage.getItem(ACCESS_TOKEN_KEY);
+            loginBtn.disabled = hasToken;
+            protectedActionBtn.disabled = !hasToken;
+            logoutBtn.disabled = !hasToken;
+            
+            if (hasToken) {
+                const expirySec = decodeTokenExpiry(localStorage.getItem(ACCESS_TOKEN_KEY));
+                updateExpiryDisplay(expirySec);
+                setStatus('Ready. Timer is running.', 'blue');
+            } else {
+                updateExpiryDisplay(null);
+                setStatus('Awaiting login...', 'black');
+            }
+        }
+
+        // --- CORE REFRESH LOGIC ---
+
+        /** Stops the current refresh timer. */
+        function stopRefreshTimer() {
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+            timerStatus.textContent = 'Timer: Not running.';
+        }
+
+        /** Starts the refresh timer based on the token's expiry time. */
+        function startRefreshTimer() {
+            stopRefreshTimer(); // Clear any existing timer
+            
+            const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
+            if (!accessToken) return;
+
+            const expiryTimeSec = decodeTokenExpiry(accessToken);
+            if (!expiryTimeSec) {
+                setStatus('Could not decode token expiry.', 'red');
+                return;
+            }
+
+            const expiryTimeMs = expiryTimeSec * 1000;
+            const nowMs = Date.now();
+
+            // Calculate when to trigger refresh (expiry - leeway)
+            const timeUntilRefreshMs = expiryTimeMs - nowMs - REFRESH_LEEWAY_MS;
+
+            if (timeUntilRefreshMs <= 0) {
+                // If already expired, refresh immediately on timer start
+                timerStatus.textContent = 'Timer: Token already near/past expiry. Refreshing now...';
+                attemptRefresh(); 
+                // Set the timer to check periodically in case of failure/new token
+                refreshTimer = setInterval(attemptRefresh, 30000); // Check every 30s
+            } else {
+                // Set the timer to fire precisely at the refresh trigger time
+                timerStatus.textContent = `Timer: Refresh scheduled in ${Math.ceil(timeUntilRefreshMs / 1000)} seconds.`;
+                
+                // Use a short interval for initial countdown display and a final setTimeout for the trigger
+                // For simplicity in a single-file demo, we'll use setInterval to check periodically.
+                const checkInterval = Math.min(timeUntilRefreshMs, 5000); // Check every 5s or less
+                
+                refreshTimer = setInterval(attemptRefresh, checkInterval);
+            }
+        }
+
+        /** Checks if refresh is needed and executes the refresh API call. */
+        async function attemptRefresh() {
+            const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
+            if (!accessToken) {
+                stopRefreshTimer();
+                return;
+            }
+
+            const expiryTimeSec = decodeTokenExpiry(accessToken);
+            if (!expiryTimeSec) return;
+
+            const expiryTimeMs = expiryTimeSec * 1000;
+            const nowMs = Date.now();
+
+            // If we are within the leeway period, refresh!
+            if (nowMs >= (expiryTimeMs - REFRESH_LEEWAY_MS)) {
+                
+                const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
+                if (!refreshToken) {
+                    setStatus('Refresh token missing. Logging out.', 'red');
+                    handleLogout();
+                    return;
+                }
+
+                setStatus('Proactively refreshing token via background timer...', 'orange');
+                stopRefreshTimer(); // Stop the current timer while refreshing
+
+                // --- SIMULATE BACKEND REFRESH LOGIC ---
+                try {
+                    await new Promise(resolve => setTimeout(resolve, 1000)); 
+
+                    // Simulate successful new token issuance
+                    const newExpirySec = Math.floor(Date.now() / 1000) + 60; // New token expires in 60 seconds (for quick demo cycle)
+                    const newAccessToken = `header.eyJ1c2VySWQiOiIxMjMiLCJpYXQiOjB9.s-timer_token_${newExpirySec}`;
+                    
+                    localStorage.setItem(ACCESS_TOKEN_KEY, newAccessToken);
+                    
+                    setStatus('Token refresh successful! ✅ Timer restarted.', 'green');
+                    updateUI(); // Updates expiry display
+                    startRefreshTimer(); // Start timer for the *new* token
+
+                } catch (error) {
+                    setStatus('Refresh failed. Logging out.', 'red');
+                    handleLogout();
+                }
+            } else {
+                 // Update the display of the remaining time
+                 const remainingSec = Math.ceil((expiryTimeMs - REFRESH_LEEWAY_MS - nowMs) / 1000);
+                 timerStatus.textContent = `Timer: Refresh scheduled in ${remainingSec > 0 ? remainingSec : 0} seconds.`;
+            }
+        }
+
+        // --- Event Handlers ---
+
+        async function handleLogin() {
+            setStatus('Logging in and getting tokens...', 'blue');
+            
+            // Create a short-lived token (e.g., 40 seconds for demo)
+            const expiryInSeconds = Math.floor(Date.now() / 1000) + 40; 
+            
+            const simulatedAccessToken = `header.eyJ1c2VySWQiOiIxMjMiLCJpYXQiOjB9.s-login_token_${expiryInSeconds}`;
+            const simulatedRefreshToken = 'simulated_long_lived_refresh_token_xyz123';
+            
+            localStorage.setItem(ACCESS_TOKEN_KEY, simulatedAccessToken);
+            localStorage.setItem(REFRESH_TOKEN_KEY, simulatedRefreshToken);
+
+            setStatus(`Login successful! AT expires in 40 seconds. Timer started.`, 'green');
+            updateUI();
+            startRefreshTimer(); // Start the core logic immediately
+        }
+
+        async function handleProtectedAction() {
+            setStatus('Requesting protected data...', 'blue');
+            
+            // --- Since the timer should keep the token fresh, we make a standard fetch ---
+            const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
+            if (!accessToken) {
+                setStatus('No token found. Please log in.', 'red');
+                return;
+            }
+
+            // SIMULATED FETCH
+            await new Promise(resolve => setTimeout(resolve, 500)); 
+            
+            setStatus(`Protected action successful! (Token was proactively refreshed.)`, 'green');
+        }
+
+        function handleLogout() {
+            localStorage.removeItem(ACCESS_TOKEN_KEY);
+            localStorage.removeItem(REFRESH_TOKEN_KEY);
+            stopRefreshTimer();
+            setStatus('Logged out successfully.', 'black');
+            updateUI();
+        }
+
+        // --- Initialization ---
+        loginBtn.addEventListener('click', handleLogin);
+        protectedActionBtn.addEventListener('click', handleProtectedAction);
+        logoutBtn.addEventListener('click', handleLogout);
+
+        updateUI(); 
+    </script>
+</body>
+</html>
